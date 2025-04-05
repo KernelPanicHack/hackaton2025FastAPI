@@ -1,109 +1,81 @@
-from collections import Counter
-from typing import List, Dict, Optional
-
+from typing import Dict
+import logging
+import pandas as pd
 import joblib
-import numpy as np
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-MODEL_PATH = "models/categorizing/sgd_classifier_model.pkl"
-VECTORIZER_PATH = "models/categorizing/tfidf_vectorizer.pkl"
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI(
-    title="API моделей категоризации и прогнозирования",
-    description="API для категоризации списка товаров и прогнозирования трат пользователя",
+    title="API",
+    description="API для сервисов",
     version="1.0.0"
 )
 
 try:
-    model = joblib.load(MODEL_PATH)
-    vectorizer = joblib.load(VECTORIZER_PATH)
-    print(f"Модели успешно загружены из {MODEL_PATH} и {VECTORIZER_PATH}")
+    model = joblib.load('models/categorizing/xgboost_model.pkl')
+    label_encoder = joblib.load('models/categorizing/label_encoder.pkl')
+    logger.info("Модель и энкодер успешно загружены")
 except Exception as e:
-    print(f"Ошибка загрузки моделей: {str(e)}")
+    logger.error(f"Ошибка загрузки модели: {str(e)}")
     model = None
-    vectorizer = None
+    label_encoder = None
 
-CONFIDENCE_THRESHOLD = 0.5
+class TransactionRequest(BaseModel):
+    Date: str
+    WithDrawal: float
+    Balance: float
 
-
-# Модели для категоризации товаров
-class CategoryItemsRequest(BaseModel):
-    items: List[str]
-
-
-class CategoryResponse(BaseModel):
+class TransactionResponse(BaseModel):
     category: str
-    categories: Optional[Dict[str, List[int]]] = None
-    status: str
-    confidence: Optional[float] = None
-
-
-# Модели для прогнозирования трат
-class ExpensePredictionRequest(BaseModel):
-    user_id: str
-    period: Optional[int] = 30
-
-
-class ExpensePredictionResponse(BaseModel):
-    predictions: Dict[str, float]
     status: str
 
+@app.get("/")
+async def root():
+    return {"message": "API готов к работе"}
 
-@app.post("/api/categorize-items", response_model=CategoryResponse)
-async def categorize_items(request: CategoryItemsRequest):
+@app.post("/api/categorize-transaction", response_model=TransactionResponse)
+async def categorize_transaction(request: TransactionRequest):
     """
-    Эндпоинт для категоризации списка товаров по их названиям
+    Эндпоинт для классификации транзакции на основе даты, суммы снятия и баланса
     """
-    if model is None or vectorizer is None:
-        raise HTTPException(status_code=500, detail="Модели не загружены")
-
+    if model is None or label_encoder is None:
+        raise HTTPException(status_code=500, detail="Модель не загружена")
+        
     try:
-
-        items = request.items
-        vect_items = vectorizer.transform(items)
-
-        probabilities = model.predict_proba(vect_items)
-
-        predictions = []
-
-        for i in range(len(probabilities)):
-            max_prob = np.max(probabilities[i])
-
-            if max_prob < CONFIDENCE_THRESHOLD:
-                predictions.append('Misc')
-            else:
-                predicted_class = model.classes_[np.argmax(probabilities[i])]
-                predictions.append(predicted_class)
-
-        category_counts = Counter(predictions)
-        most_common_category = category_counts.most_common(1)[0][0]
-        confidence = category_counts[most_common_category] / len(predictions)
-
+        logger.info(f"Получен запрос: {request.dict()}")
+        
+        date_obj = pd.to_datetime(request.Date)
+        
+        features = {
+            'Year': date_obj.year,
+            'Month': date_obj.month,
+            'Day': date_obj.day,
+            'Withdrawal': request.WithDrawal,
+            'Deposit': 0,
+            'Balance': request.Balance
+        }
+        
+        X = pd.DataFrame([features])
+        logger.info(f"Подготовленные данные: {X}")
+        
+        prediction = model.predict(X)[0]
+        
+        if hasattr(label_encoder, 'inverse_transform'):
+            category = label_encoder.inverse_transform([prediction])[0]
+        else:
+            category = str(prediction)
+            
+        logger.info(f"Предсказанная категория: {category}")
+        
         return {
-            "category": most_common_category,
-            "status": "success",
-            "confidence": confidence
+            "category": category,
+            "status": "success"
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Ошибка при категоризации товаров: {str(e)}")
-
-
-@app.post("/api/predict-expenses", response_model=ExpensePredictionResponse)
-async def predict_expenses(request: ExpensePredictionRequest):
-    """
-    Эндпоинт для прогнозирования трат пользователя
-    """
-    return {"predictions": {}, "status": "not implemented yet"}
-
-
-# Health-check эндпоинт
-@app.get("/health")
-async def health_check():
-    return {
-        "status": "OK",
-        "api_version": "1.0.0",
-        "models_loaded": {
-            "categorizing": model is not None and vectorizer is not None
-        }
-    }
+        logger.error(f"Ошибка при классификации транзакции: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Ошибка при классификации транзакции: {str(e)}")
